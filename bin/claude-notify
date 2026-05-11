@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+claude-notify — fire a macOS notification when Claude Code needs attention.
+
+Invoked synchronously by Claude Code hooks. Reads the hook JSON payload from
+stdin and the iTerm session id from $ITERM_SESSION_ID, decides whether to
+notify, and shells out to terminal-notifier.
+
+Contract: this script always exits 0 within DEADLINE_SECONDS — hook failures
+must never propagate to Claude Code.
+
+Usage (from hook command):
+  claude-notify <event-name>
+
+Where <event-name> is one of: notification, stop, subagent_stop.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---- Configuration --------------------------------------------------------
+
+DEADLINE_SECONDS = 1.0  # absolute wall-clock cap; we exit 0 if we exceed this
+FRONTMOST_PROBE_TIMEOUT = 0.2
+NOTIFIER_TIMEOUT = 0.5
+
+LOG_PATH = Path.home() / "Library" / "Logs" / "claude-notify.log"
+LOG_MAX_BYTES = 1_000_000  # rotate at ~1MB
+CONFIG_PATH = Path.home() / ".config" / "claude-notify" / "config.json"
+
+# Helper invoked when the user clicks a notification.
+# In dev: lives next to this script under the project bin/.
+# After install: lives in ~/.local/bin/.
+SCRIPT_DIR = Path(__file__).resolve().parent
+FOCUS_HELPER = SCRIPT_DIR / "focus-iterm-session"
+
+DEFAULT_CONFIG = {
+    "notify_on_notification": True,
+    "notify_on_stop": False,            # disabled until Session 2 adds suppression rules
+    "notify_on_subagent_stop": False,
+    "sound_notification": "Glass",
+    "sound_stop": None,
+    "sound_subagent_stop": None,
+    "skip_if_frontmost": True,
+}
+
+UUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+
+
+# ---- Deadline handling ----------------------------------------------------
+
+def _deadline_handler(signum, frame):
+    _log({"outcome": "deadline_exceeded"})
+    sys.exit(0)
+
+
+# ---- Logging --------------------------------------------------------------
+
+def _log(record):
+    record["ts"] = time.time()
+    record.setdefault("pid", os.getpid())
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            try:
+                LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+            except Exception:
+                pass
+        with open(LOG_PATH, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
+# ---- Config ---------------------------------------------------------------
+
+def _load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH) as f:
+            user_cfg = json.load(f)
+        if isinstance(user_cfg, dict):
+            cfg.update(user_cfg)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return cfg
+
+
+# ---- Session identification -----------------------------------------------
+
+def _session_uuid_from_env():
+    raw = os.environ.get("ITERM_SESSION_ID", "")
+    if not raw:
+        return None
+    # Format observed: "w<W>t<T>p<P>:<UUID>" — strip everything up to last colon.
+    uuid = raw.rsplit(":", 1)[-1]
+    return uuid if UUID_RE.match(uuid) else None
+
+
+def _frontmost_session_uuid():
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "iTerm" to return unique id of current session of current window'],
+            capture_output=True, text=True, timeout=FRONTMOST_PROBE_TIMEOUT,
+        )
+        if result.returncode == 0:
+            uuid = result.stdout.strip()
+            return uuid if UUID_RE.match(uuid) else None
+    except Exception:
+        pass
+    return None
+
+
+# ---- Rendering ------------------------------------------------------------
+
+def _render(event_type, payload):
+    cwd = payload.get("cwd") or os.environ.get("PWD") or ""
+    cwd_base = os.path.basename(cwd.rstrip("/")) if cwd else "?"
+
+    if event_type == "notification":
+        title = f"Claude needs you · {cwd_base}"
+        body = (
+            payload.get("message")
+            or payload.get("prompt")
+            or "Waiting for input"
+        )
+    elif event_type == "stop":
+        title = f"Claude done · {cwd_base}"
+        body = payload.get("last_message") or "Turn complete"
+    elif event_type == "subagent_stop":
+        title = f"Subagent done · {cwd_base}"
+        body = "Subagent finished"
+    else:
+        title = f"Claude · {cwd_base}"
+        body = f"event={event_type}"
+
+    if len(body) > 200:
+        body = body[:197] + "..."
+    return title, body
+
+
+# ---- Main -----------------------------------------------------------------
+
+def _run():
+    if os.environ.get("CLAUDE_NOTIFY_DISABLE") == "1":
+        return {"outcome": "skipped", "reason": "kill_switch_env"}
+
+    event_type = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+
+    payload = {}
+    payload_raw = ""
+    try:
+        if not sys.stdin.isatty():
+            payload_raw = sys.stdin.read()
+            if payload_raw.strip():
+                payload = json.loads(payload_raw)
+    except Exception as e:
+        payload = {"_parse_error": str(e), "_raw_excerpt": payload_raw[:120]}
+
+    config = _load_config()
+
+    session_uuid = _session_uuid_from_env()
+    if not session_uuid:
+        return {
+            "outcome": "skipped",
+            "reason": "no_iterm_session",
+            "event": event_type,
+            "payload_keys": sorted(payload.keys()),
+        }
+
+    flag_key = f"notify_on_{event_type}"
+    if not config.get(flag_key, True):
+        return {
+            "outcome": "skipped",
+            "reason": f"disabled_by_config:{flag_key}",
+            "event": event_type,
+            "session_uuid": session_uuid,
+            "payload_keys": sorted(payload.keys()),
+        }
+
+    if config.get("skip_if_frontmost", True):
+        front = _frontmost_session_uuid()
+        if front == session_uuid:
+            return {
+                "outcome": "skipped",
+                "reason": "frontmost",
+                "event": event_type,
+                "session_uuid": session_uuid,
+                "payload_keys": sorted(payload.keys()),
+            }
+
+    title, body = _render(event_type, payload)
+    sound = config.get(f"sound_{event_type}")
+
+    cmd = [
+        "terminal-notifier",
+        "-title", title,
+        "-message", body,
+        "-group", f"claude-notify:{session_uuid}",
+    ]
+    if sound:
+        cmd.extend(["-sound", sound])
+    cmd.extend(["-execute", f"{FOCUS_HELPER} {session_uuid}"])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=NOTIFIER_TIMEOUT)
+    except FileNotFoundError:
+        return {
+            "outcome": "terminal_notifier_missing",
+            "event": event_type,
+            "session_uuid": session_uuid,
+            "payload_keys": sorted(payload.keys()),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "outcome": "notifier_timeout",
+            "event": event_type,
+            "session_uuid": session_uuid,
+            "payload_keys": sorted(payload.keys()),
+        }
+
+    if result.returncode != 0:
+        return {
+            "outcome": "notifier_error",
+            "rc": result.returncode,
+            "stderr": (result.stderr or "")[:200],
+            "event": event_type,
+            "session_uuid": session_uuid,
+            "payload_keys": sorted(payload.keys()),
+        }
+
+    return {
+        "outcome": "notified",
+        "event": event_type,
+        "session_uuid": session_uuid,
+        "title": title,
+        "body_excerpt": body[:80],
+        "payload_keys": sorted(payload.keys()),
+    }
+
+
+def main():
+    signal.signal(signal.SIGALRM, _deadline_handler)
+    signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
+
+    started = time.monotonic()
+    try:
+        record = _run()
+    except SystemExit:
+        raise
+    except BaseException as e:
+        record = {"outcome": "exception", "error": repr(e)}
+    record["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
+    _log(record)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
